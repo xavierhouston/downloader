@@ -1,0 +1,9 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/TorrentDownloader.Core/TorrentDownloader.Core.csproj" />
+    <Project Path="src/TorrentDownloader.UI/TorrentDownloader.UI.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/TorrentDownloader.Tests/TorrentDownloader.Tests.csproj" />
+  </Folder>
+</Solution>
