@@ -13,11 +13,12 @@ namespace TorrentDownloader.Core.Services;
 public sealed class HttpDownloadService : IDisposable
 {
     private const int BufferSize = 81920;
-    private const int MaxAutoRetriesWithNoProgress = 5;
+    private const int MaxAutoRetriesWithNoProgress = 20;
+    private static readonly TimeSpan MaxRetryBackoff = TimeSpan.FromMinutes(2);
 
     private readonly TimeSpan _stallTimeout;
     private readonly TimeSpan _retryDelay;
-    private readonly HttpClient _httpClient = new();
+    private readonly HttpClient _httpClient;
     private readonly ConcurrentDictionary<Guid, DownloadEntry> _entries = new();
     private readonly NetworkMonitorService _networkMonitor;
     private readonly HashSet<Guid> _autoPausedIds = new();
@@ -27,12 +28,17 @@ public sealed class HttpDownloadService : IDisposable
     // matches the "one Download limit setting" the UI presents.
     private readonly RateLimiter _downloadRateLimiter = new();
 
-    public HttpDownloadService(NetworkMonitorService networkMonitor, TimeSpan? stallTimeout = null, TimeSpan? retryDelay = null)
+    public HttpDownloadService(
+        NetworkMonitorService networkMonitor,
+        TimeSpan? stallTimeout = null,
+        TimeSpan? retryDelay = null,
+        HttpMessageHandler? httpMessageHandler = null)
     {
         _networkMonitor = networkMonitor;
         _networkMonitor.ConnectivityChanged += OnConnectivityChanged;
         _stallTimeout = stallTimeout ?? TimeSpan.FromSeconds(30);
         _retryDelay = retryDelay ?? TimeSpan.FromSeconds(5);
+        _httpClient = httpMessageHandler is null ? new HttpClient() : new HttpClient(httpMessageHandler);
     }
 
     /// <summary>0 (or negative) means unlimited.</summary>
@@ -187,21 +193,52 @@ public sealed class HttpDownloadService : IDisposable
     private async Task DownloadAsync(DownloadEntry entry, bool resume, CancellationToken token)
     {
         var bytesAtAttemptStart = entry.DownloadedBytes;
+        TimeSpan? retryAfterHint = null;
 
         try
         {
-            using var request = new HttpRequestMessage(HttpMethod.Get, entry.Url);
             var resumeOffset = resume ? entry.DownloadedBytes : 0;
+
+            if (resumeOffset > 0)
+            {
+                // Trust the disk over the in-memory number before seeking. If they ever disagree
+                // (killed mid-write, the file was touched externally, a session-restore record
+                // that's stale) and the real file is *shorter* than we think, seeking to the
+                // remembered offset would land past the real end of file - on Windows/NTFS that
+                // silently succeeds and creates a zero-filled gap instead of erroring, which
+                // would corrupt a 100GB file with no visible failure at all.
+                var actualBytesOnDisk = File.Exists(entry.FilePath) ? new FileInfo(entry.FilePath).Length : 0;
+                if (actualBytesOnDisk < resumeOffset)
+                {
+                    resumeOffset = actualBytesOnDisk;
+                    entry.DownloadedBytes = actualBytesOnDisk;
+                }
+            }
+
+            using var request = new HttpRequestMessage(HttpMethod.Get, entry.Url);
             if (resumeOffset > 0)
                 request.Headers.Range = new RangeHeaderValue(resumeOffset, null);
 
             using var response = await _httpClient.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, token).ConfigureAwait(false);
+            retryAfterHint = response.Headers.RetryAfter?.Delta
+                ?? (response.Headers.RetryAfter?.Date is { } retryDate ? retryDate - DateTimeOffset.UtcNow : null);
 
             var isResumedTransfer = resumeOffset > 0 && response.StatusCode == HttpStatusCode.PartialContent;
-            if (resumeOffset > 0 && !isResumedTransfer)
+
+            // Only a *successful* response that ignores our Range header (200 OK with the full
+            // body) means "restart clean, and this time write the whole thing from byte 0".
+            // An error response (503, 500, 429, ...) must NOT wipe our progress - that previously
+            // zeroed DownloadedBytes before EnsureSuccessStatusCode() below even threw, so a
+            // transient server error permanently discarded tens of GB of real progress on disk
+            // (the next attempt then opened the file with FileMode.Create and truncated it).
+            // A genuinely invalid offset (416) is the one error case that does mean "start over".
+            if (response.StatusCode == HttpStatusCode.RequestedRangeNotSatisfiable)
             {
-                // Server ignored our Range request (200 OK with the full body) — restart clean
-                // rather than append full content onto what we already have and corrupt the file.
+                resumeOffset = 0;
+                entry.DownloadedBytes = 0;
+            }
+            else if (resumeOffset > 0 && !isResumedTransfer && response.IsSuccessStatusCode)
+            {
                 resumeOffset = 0;
                 entry.DownloadedBytes = 0;
             }
@@ -285,45 +322,96 @@ public sealed class HttpDownloadService : IDisposable
         {
             // Pause/remove already set the desired state before cancelling.
         }
-        catch (StallTimeoutException)
-        {
-            // Only count this against the retry budget if the attempt made zero progress -
-            // a link that connects and transfers *something* each time before eventually
-            // stalling again is still worth retrying indefinitely; one that never moves at
-            // all is genuinely broken and shouldn't retry forever.
-            var madeProgress = entry.DownloadedBytes > bytesAtAttemptStart;
-            entry.ConsecutiveNoProgressFailures = madeProgress ? 0 : entry.ConsecutiveNoProgressFailures + 1;
-
-            if (entry.ConsecutiveNoProgressFailures <= MaxAutoRetriesWithNoProgress)
-            {
-                entry.State = HttpDownloadState.Paused;
-                _ = Task.Delay(_retryDelay).ContinueWith(_ => StartDownloadLoop(entry, resume: true));
-            }
-            else
-            {
-                entry.State = HttpDownloadState.Error;
-                entry.ErrorMessage = $"Stalled repeatedly with no progress after {MaxAutoRetriesWithNoProgress} retries. Click Resume to try again.";
-            }
-        }
         catch (Exception ex)
         {
-            // A dropped connection can throw here *faster* than our network-monitor poll/event
-            // detects the outage and explicitly cancels the token (that path lands in the
-            // OperationCanceledException branch above and is already tracked for auto-resume).
-            // Without this check, that race left the download stuck in Error forever, since it
-            // was never added to the auto-resume set - reconnecting had nothing to resume.
-            if (!_networkMonitor.IsOnline)
-            {
-                entry.State = HttpDownloadState.Paused;
-                lock (_autoPauseLock) _autoPausedIds.Add(entry.Id);
-            }
-            else
-            {
-                entry.State = HttpDownloadState.Error;
-                entry.ErrorMessage = ex.Message;
-            }
+            HandleFailure(entry, ex, madeProgressThisAttempt: entry.DownloadedBytes > bytesAtAttemptStart, retryAfterHint);
         }
     }
+
+    /// <summary>
+    /// One place for every failure mode a multi-hour, many-GB transfer can hit: stalls, dropped
+    /// connections, DNS blips, and every HTTP error status. A 100GB download can run for hours,
+    /// during which transient failures (503/502/504/429, momentary drops) are the *norm*, not
+    /// the exception - requiring a manual click every time would make the app unusable for that
+    /// use case. So: genuinely permanent failures (bad URL, forbidden, gone) fail fast without
+    /// wasting retries; everything else gets bounded, backed-off auto-retry, exactly like an
+    /// actual disconnect already did. A real network outage still takes priority and defers to
+    /// the network-monitor's own auto-pause/resume instead of this method's retry loop.
+    /// </summary>
+    private void HandleFailure(DownloadEntry entry, Exception ex, bool madeProgressThisAttempt, TimeSpan? retryAfterHint)
+    {
+        if (!_networkMonitor.IsOnline)
+        {
+            // A dropped connection can throw here *faster* than the network-monitor poll/event
+            // detects the outage and explicitly cancels the token (that path lands in the
+            // OperationCanceledException branch above and is already tracked for auto-resume).
+            // Without this check here too, that race left the download stuck in Error forever,
+            // since it was never added to the auto-resume set - reconnecting had nothing to resume.
+            entry.State = HttpDownloadState.Paused;
+            lock (_autoPauseLock) _autoPausedIds.Add(entry.Id);
+            return;
+        }
+
+        if (IsPermanentFailure(ex, out var reason))
+        {
+            entry.ConsecutiveNoProgressFailures = 0;
+            entry.State = HttpDownloadState.Error;
+            entry.ErrorMessage = reason;
+            return;
+        }
+
+        // Only count this against the retry budget if the attempt made zero progress - a link
+        // that connects and transfers *something* each time before eventually failing again is
+        // still worth retrying indefinitely; one that never moves at all is genuinely stuck.
+        entry.ConsecutiveNoProgressFailures = madeProgressThisAttempt ? 0 : entry.ConsecutiveNoProgressFailures + 1;
+
+        if (entry.ConsecutiveNoProgressFailures > MaxAutoRetriesWithNoProgress)
+        {
+            entry.State = HttpDownloadState.Error;
+            entry.ErrorMessage = $"{DescribeError(ex)} — stalled repeatedly with no progress after {MaxAutoRetriesWithNoProgress} retries. Click Resume to try again.";
+            return;
+        }
+
+        entry.State = HttpDownloadState.Paused;
+        entry.ErrorMessage = DescribeError(ex);
+
+        var backoff = TimeSpan.FromSeconds(_retryDelay.TotalSeconds * Math.Pow(2, entry.ConsecutiveNoProgressFailures - 1));
+        if (backoff > MaxRetryBackoff)
+            backoff = MaxRetryBackoff;
+
+        // A server telling us exactly how long to wait (Retry-After, common on 429/503) always
+        // wins over our own guess.
+        var delay = retryAfterHint is { } hint && hint > TimeSpan.Zero ? hint : backoff;
+
+        _ = Task.Delay(delay).ContinueWith(_ => StartDownloadLoop(entry, resume: true));
+    }
+
+    /// <summary>
+    /// Failures worth retrying automatically (server hiccups, rate limiting, dropped
+    /// connections, DNS blips, our own stall watchdog) vs. ones that won't fix themselves no
+    /// matter how many times we ask (bad request, unauthorized, forbidden, not found, gone) -
+    /// those fail fast instead of burning through the retry budget on something that will never
+    /// succeed.
+    /// </summary>
+    private static bool IsPermanentFailure(Exception ex, out string reason)
+    {
+        if (ex is HttpRequestException { StatusCode: { } statusCode } && statusCode is
+                HttpStatusCode.BadRequest or
+                HttpStatusCode.Unauthorized or
+                HttpStatusCode.Forbidden or
+                HttpStatusCode.NotFound or
+                HttpStatusCode.Gone)
+        {
+            reason = $"HTTP {(int)statusCode} {statusCode} — this link isn't available, retrying won't help.";
+            return true;
+        }
+
+        reason = "";
+        return false;
+    }
+
+    private static string DescribeError(Exception ex) =>
+        ex is HttpRequestException { StatusCode: { } statusCode } ? $"HTTP {(int)statusCode} {statusCode}" : ex.Message;
 
     private static HttpDownloadInfo ToInfo(DownloadEntry entry)
     {
