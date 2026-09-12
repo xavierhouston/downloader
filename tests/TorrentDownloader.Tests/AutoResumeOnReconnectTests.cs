@@ -13,7 +13,7 @@ public class AutoResumeOnReconnectTests
         var saveDir = Path.Combine(Path.GetTempPath(), "TorrentDownloaderTests", Guid.NewGuid().ToString());
 
         // A slow-ish, real file so the download is still in flight when we flip connectivity.
-        var info = await service.AddAsync("https://releases.ubuntu.com/24.04.5/ubuntu-24.04.5-desktop-amd64.iso", saveDir);
+        var info = await service.AddAsync("https://releases.ubuntu.com/24.04.5/ubuntu-24.04.4-desktop-amd64.iso", saveDir);
 
         // Wait until it's actually started transferring.
         await WaitForStateAsync(service, info.Id, s => s is HttpDownloadState.Downloading, TimeSpan.FromSeconds(15));
@@ -44,7 +44,7 @@ public class AutoResumeOnReconnectTests
         using var service = new HttpDownloadService(networkMonitor);
         var saveDir = Path.Combine(Path.GetTempPath(), "TorrentDownloaderTests", Guid.NewGuid().ToString());
 
-        var info = await service.AddAsync("https://releases.ubuntu.com/24.04.5/ubuntu-24.04.5-desktop-amd64.iso", saveDir);
+        var info = await service.AddAsync("https://releases.ubuntu.com/24.04.5/ubuntu-24.04.4-desktop-amd64.iso", saveDir);
         await WaitForStateAsync(service, info.Id, s => s is HttpDownloadState.Downloading, TimeSpan.FromSeconds(15));
 
         await service.PauseAsync(info.Id);
