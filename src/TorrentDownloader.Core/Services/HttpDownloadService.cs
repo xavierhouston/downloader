@@ -91,6 +91,24 @@ public sealed class HttpDownloadService : IDisposable
         return Task.CompletedTask;
     }
 
+    /// <summary>Swaps in a freshly generated link for a download whose old one expired
+    /// mid-transfer, then resumes from the byte offset already on disk (via the same Range
+    /// header logic as an ordinary resume) instead of starting over from 0. Only the URL
+    /// changes - the server is trusted to be serving the same file at the new link.</summary>
+    public Task UpdateUrlAndResumeAsync(Guid id, string newUrl)
+    {
+        lock (_autoPauseLock) _autoPausedIds.Remove(id);
+
+        if (_entries.TryGetValue(id, out var entry) && entry.State is HttpDownloadState.Paused or HttpDownloadState.Error)
+        {
+            entry.Url = newUrl;
+            entry.ConsecutiveNoProgressFailures = 0;
+            StartDownloadLoop(entry, resume: true);
+        }
+
+        return Task.CompletedTask;
+    }
+
     public Task RemoveAsync(Guid id, bool deleteFile)
     {
         lock (_autoPauseLock) _autoPausedIds.Remove(id);
@@ -488,7 +506,10 @@ public sealed class HttpDownloadService : IDisposable
     private sealed class DownloadEntry(Guid id, string url, string fileName, string filePath)
     {
         public Guid Id { get; } = id;
-        public string Url { get; } = url;
+
+        // Mutable: UpdateUrlAndResumeAsync swaps this in when the original link expired
+        // mid-transfer, so the resume-from-offset logic below can retry against the new one.
+        public string Url = url;
 
         // Mutable: DownloadAsync may rename these once a Content-Disposition header
         // reveals a better filename than the URL's (see the resumeOffset == 0 branch there).

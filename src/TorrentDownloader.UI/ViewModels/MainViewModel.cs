@@ -175,6 +175,21 @@ public partial class MainViewModel : ViewModelBase, IDisposable
     }
 
     [RelayCommand]
+    private async Task UpdateLinkAndResumeAsync(HttpDownloadItemViewModel item)
+    {
+        var newUrl = item.NewUrlInput.Trim();
+        if (!Uri.TryCreate(newUrl, UriKind.Absolute, out var uri) || (uri.Scheme != Uri.UriSchemeHttp && uri.Scheme != Uri.UriSchemeHttps))
+        {
+            StatusMessage = "Please enter a valid http:// or https:// link.";
+            return;
+        }
+
+        await _httpDownloadService.UpdateUrlAndResumeAsync(item.Id, newUrl);
+        item.NewUrlInput = "";
+        RefreshSnapshot();
+    }
+
+    [RelayCommand]
     private async Task PauseDownloadAsync(HttpDownloadItemViewModel item)
     {
         await _httpDownloadService.PauseAsync(item.Id);

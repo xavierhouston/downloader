@@ -158,6 +158,13 @@
                                         </StackPanel>
                                     </Grid>
 
+                                    <StackPanel Orientation="Horizontal" Spacing="6" IsVisible="{Binding IsPaused}">
+                                        <TextBox Text="{Binding NewUrlInput}" PlaceholderText="Paste a new link to resume an expired download…" Width="320" FontSize="11" />
+                                        <Button Classes="pillAction" Content="Update Link &amp; Resume"
+                                                Command="{Binding $parent[ItemsControl].((vm:MainViewModel)DataContext).UpdateLinkAndResumeCommand}"
+                                                CommandParameter="{Binding}" />
+                                    </StackPanel>
+
                                     <StackPanel Orientation="Horizontal" Spacing="8">
                                         <Border Background="{DynamicResource SystemAccentColor}" CornerRadius="10" Padding="9,3" Opacity="0.85">
                                             <TextBlock Text="{Binding StateText}" FontSize="11" Foreground="White" />
