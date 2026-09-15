@@ -32,6 +32,12 @@ public partial class HttpDownloadItemViewModel : ViewModelBase
     [ObservableProperty]
     public partial bool IsCompleted { get; set; }
 
+    /// <summary>Bound to the "new link" text box shown when the download is paused/errored -
+    /// lets the user paste a freshly generated URL (the old one expired) and resume from the
+    /// bytes already on disk instead of restarting the whole file.</summary>
+    [ObservableProperty]
+    public partial string NewUrlInput { get; set; } = "";
+
     public HttpDownloadItemViewModel(HttpDownloadInfo info)
     {
         Id = info.Id;
